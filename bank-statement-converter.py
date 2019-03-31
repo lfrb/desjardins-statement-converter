@@ -2,10 +2,14 @@
 
 import argparse
 import math
+import html
 import os
 import re
 import subprocess
 import sys
+
+from decimal import *
+from datetime import date
 
 CREDIT_PARAMS = {
         'epsilonx'     : 0.01,
@@ -13,7 +17,7 @@ CREDIT_PARAMS = {
         'char_width'   : 4.8,
         'char_height'  : 6.288,
         'line_spacing' : 0.912,
-        'page_offset'  : 322.068000,
+        'page_offset'  : 319.118,
         'dont_split'   : False
 }
 
@@ -31,6 +35,20 @@ PARAMS = None
 
 MONTHS = ['JAN', 'FEV', 'MAR', 'AVR', 'MAI', 'JUN',
           'JUL', 'AOU', 'SEP', 'OCT', 'NOV', 'DEC']
+
+SUMMARY_SECTION_HEADER     = { "fr": "SOMMAIRE DES TRANSACTIONS COURANTES" }
+PREV_BALANCE_LABEL         = { "fr": "Solde précédent" }
+CURR_BALANCE_LABEL         = { "fr": "Nouveau solde courant =" }
+TRANSACTION_SECTION_HEADER = { "fr": "DESCRIPTION DES TRANSACTIONS COURANTES" }
+TRANSACTION_TABLE_HEADER   = { "fr": "Transactions effectuées avec la carte de" }
+OPERATION_TABLE_HEADER     = { "fr": "Opérations au compte" }
+VOLUME_SECTION_HEADER      = { "fr": "VOLUME D'ACHATS ANNUEL" }
+REWARD_SECTION_HEADER      = { "fr": "PROGRAMME DE RÉCOMPENSES - CARTES DESJARDINS" }
+
+VALID_REWARD_PATTERN = [
+    "CRÉDIT DONS BONIDOLLARS",
+    "CRÉDIT VOYAGE BONI DESJARDINS"
+]
 
 OFX_HEADER =  '''OFXHEADER:100
 DATA:OFXSGML
@@ -109,8 +127,9 @@ wordexp = re.compile('\s*<word xMin="(\d+\.\d+)" yMin="(\d+\.\d+)" xMax="(\d+\.\
 class Statement:
     def __init__(self):
         self.pages = []
+        self.sections = []
 
-    def parse(self, lines):
+    def load(self, lines):
         current_page = None
         page_index = 0
         for line in lines:
@@ -152,12 +171,37 @@ class Statement:
                 words.append(word)
         return words
 
+    def add_section(self, section):
+        self.sections.append(section)
+
+    def parse(self):
+        self._current_section = None
+        for page in statement.pages:
+            for line in page.lines():
+                for section in self.sections:
+                    if line.startswith(section.header):
+                        self._current_section = section
+                        self._current_section.begin_parsing()
+                if self._current_section:
+                    self._current_section.parse_line(line)
+
 class Page:
     def __init__(self, index, w, h):
         self.index = index
         self.width = w
         self.height = h
         self.words = []
+
+    def lines(self):
+        self.words = sorted(self.words, key=lambda w: w.box.y1)
+        words = []
+        for word in self.words:
+            if words and word.box.y1 >= words[-1].box.y1 + PARAMS['epsilony']:
+                yield Line(list(words))
+                words = []
+            words.append(word)
+        if words:
+            yield Line(words)
 
     def get_line(self, y1, y2):
         words = []
@@ -203,7 +247,7 @@ class Rect:
 class Word:
     def __init__(self, xmin, ymin, xmax, ymax, content, page):
         self.box = Rect(xmin, xmax, ymin, ymax)
-        self.content = content
+        self.content = html.unescape(content)
         self.page = page
 
     def substring(self, x1, x2):
@@ -226,11 +270,66 @@ class Word:
     def __str__(self):
         return "<Word \"{0}\" at {1}>".format(self.content, self.box)
 
+class Line:
+    def __init__(self, words):
+        self.words = words
+        self.string = ""
+        for word in words:
+            self.string += word.content + " "
+
+    def startswith(self, prefix):
+        return self.string.startswith(prefix)
+
+    def __str__(self):
+        return self.string
+
+class Section:
+    def __init__(self, header, objects=dict()):
+        self.header = header
+        self.tables = []
+        self.values = []
+        self.objects = objects
+
+    def add_table(self, table):
+        self.tables.append(table)
+
+    def add_value(self, value):
+        self.values.append(value)
+
+    def begin_parsing(self):
+        self._current_table = None
+
+    def parse_line(self, line):
+        for value in self.values:
+            if line.startswith(value.label):
+                ret = value.parse_value(line.string.replace(value.label, ''))
+                self.objects[value.name] = ret
+                return
+
+        for table in self.tables:
+            if table.header is None or line.startswith(table.header):
+                self._current_table = table
+                self._current_table.begin_parsing()
+        if self._current_table:
+            try:
+                obj = self._current_table.parse_line(line)
+                if obj:
+                    self.objects.append(obj)
+            except:
+                pass
+
+class Value:
+    def __init__(self, label, name, value_class):
+        self.label = label
+        self.name = name
+        self._value_class = value_class
+
+    def parse_value(self, value):
+        return self._value_class(value)
+
 class Table:
-    def __init__(self, position, page_limit, y_limit, row_class, row_data):
-        self.position = position
-        self.page_limit = page_limit
-        self.y_limit = y_limit
+    def __init__(self, header, row_class, row_data):
+        self.header = header
         self._columns = []
         self._row_class = row_class
         self._row_data = row_data
@@ -238,53 +337,29 @@ class Table:
     def add_column(self, name, position, alignment, max_width, optional=False, key=False, multiline=False):
         self._columns.append(Column(name, position, alignment, max_width, optional, multiline, key))
 
-    def _parse_line(self, words, row=None):
-        if not row:
-            row = Row()
+    def begin_parsing(self):
+        self._current_row = None
+
+    def parse_line(self, line):
+        row = self._current_row or Row()
         possible_line_break = False
         last_value = None
         for column in self._columns:
             if column.name in row:
                 continue
-            value = column.parse(words)
+            value = column.parse(line.words)
             if not value and not column.optional:
-                return row, possible_line_break
+                if possible_line_break:
+                    self._current_row = row
+                return None
             if value and value.strip() != '':
                 if column.key:
                     row.key = int(value)
                 row.add_field(column.name, value)
                 last_value = column.name
                 possible_line_break = column.multiline
-        return row, False
-
-    def parse(self, statement):
-        y = self.position
-        objects = []
-        row = None
-        for page in statement.pages:
-            while y <= page.height:
-                line = page.get_line(y, y + PARAMS['char_height'])
-                if line:
-                    string = ""
-                    for word in line:
-                        string += word.content + " "
-                    #print(string)
-
-                    y = line[0].box.y1
-                    try:
-                        row, partial = self._parse_line(line, row)
-                        if row and not partial:
-                            obj = self._row_class(row, self._row_data)
-                            objects.append(obj)
-                            row = None
-                    except Exception as e:
-                        row = None
-                        pass
-                y += PARAMS['char_height'] + PARAMS['line_spacing']
-                if page.index >= self.page_limit and y >= self.y_limit:
-                    return objects
-            y = PARAMS['page_offset']
-        return objects
+        self._current_row = None
+        return self._row_class(row, self._row_data)
 
 class Column:
     LEFT = 1
@@ -335,46 +410,113 @@ class Row:
         return str(self._fields)
 
 class Transaction:
-    def __init__(self, row, data):
+    def __init__(self, row, statement_date):
         self.id = row['id']
-        self.date = "{}{:02d}{:02d}".format(data, int(row['month']), int(row['day']))
+        self.date = date(statement_date.year, int(row['month']), int(row['day']))
+        if self.date > statement_date:
+            self.date = self.date.replace(self.date.year - 1)
         self.description = row['desc']
-        self.location = row['city'] + ' ' + row['state']
-        self.amount = float(row['amount'].replace(' ', '').replace(',', '.'))
+        self.location = ""
+        if 'city' in row and 'state' in row:
+            self.location = row['city'] + ' ' + row['state']
+        self.amount = Decimal(row['amount'].replace(' ', '').replace(',', '.'))
         if 'credit' in row:
             self.amount *= -1
+        self.reward = 0
+        self.valid_for_volume = True
+        self.skipped = False
+
+    def is_valid_for_volume(self):
+        return self.valid_for_volume and not self.skipped
+
+    def is_reward_spending(self):
+        for pattern in VALID_REWARD_PATTERN:
+            if pattern in self.description:
+                return True
+        return False
+
+    def calculate_reward(self, volume, rate, extra_rate):
+        if not self.is_valid_for_volume():
+            return
+        rate = extra_rate/100 if volume > 20000 else rate/100
+        self.reward = round(rate * self.amount, 2)
 
     def to_csv(self):
-        withdraw = 0
-        deposit = 0
-        if self.amount > 0:
-            deposit = self.amount
-        else:
-            withdraw = -1 * self.amount
-        return "{},\"{} {}\",{},{},{}".format(self.date, self.description, self.location, deposit, withdraw, self.balance)
+        return "{:%Y/%m/%d},\"{}\",\"{}\",{},{},{}".format(self.date, self.description, self.location, self.amount, -1 * self.balance, self.reward)
 
     def __str__(self):
-        return "{} - {} - {:25} - {:8.2f}".format(self.id, self.date, self.description, self.amount)
+        return "{} - {:%Y/%m/%d} - {:25} - {:8.2f}".format(self.id, self.date, self.description, self.amount)
 
-class Operation:
+class Operation(Transaction):
+    def __init__(self, row, statement_date):
+        Transaction.__init__(self, row, statement_date)
+        self.valid_for_volume = self.is_reward_spending()
+
+class RewardSpendingTransaction(Transaction):
+    def __init__(self, date, amount):
+        self.id = "888"
+        self.date = date
+        self.description = "Crédit Bonidollars"
+        self.location = ""
+        self.amount = 0
+        self.reward = amount
+
+class RewardAdjustmentTransaction(Transaction):
+    def __init__(self, date, amount):
+        self.id = "999"
+        self.date = date
+        self.description = "Ajustement Bonidollars"
+        self.location = ""
+        self.amount = 0
+        self.reward = amount
+
+class VolumeSummary:
+    def __init__(self, row, data):
+        self.initial = self.parse_money(row['initial'])
+        self.final = self.parse_money(row['final'])
+
+    def parse_money(self, value):
+        return Decimal(value.replace('$', '').replace(' ', '').replace(',', '.').strip())
+
+class RewardSummary:
+    def __init__(self, row, data):
+        self.initial = self.parse_money(row['initial'])
+        self.final = self.parse_money(row['final'])
+        self.received = self.parse_money(row['received'])
+        self.spent = self.parse_money(row['spent'])
+        self.adjustment = self.parse_money(row['adjustment'])
+
+    def parse_money(self, value):
+        if '-' in value:
+            value = '-' + value[:-1]
+        return Decimal(value.replace(' ', '').replace(',', '.').strip())
+
+class Money:
+    def __init__(self, value):
+        amount = re.compile("\s*\d+\.\d\d")
+        self.value = amount.match(value.replace(' ', '').replace(',', '.'))
+        self.value = Decimal(self.value.group())
+
+class EOPOperation:
     def __init__(self, row, data):
         day, month = row['date'].split(' ')
         self.date = "{}{:02d}{:02d}".format(data, MONTHS.index(month) + 1, int(day))
         self.description = row['desc']
 
         if 'retrait' in row and row['retrait'] != '':
-            self.amount = Operation.parse_money(row['retrait'], -1)
+            self.amount = EOPOperation.parse_money(row['retrait'], -1)
         elif 'depot' in row and row['depot'] != '':
-            self.amount = Operation.parse_money(row['depot'])
+            self.amount = EOPOperation.parse_money(row['depot'])
 
-        self.balance = Operation.parse_money(row['solde'])
+        self.balance = EOPOperation.parse_money(row['solde'])
         self.code = row['code']
+        self.reward = 0
 
     def parse_money(value, factor=1):
         if value.endswith('-'):
             factor *= -1
             value = value[:-1]
-        return factor * float(value.replace(' ', ''))
+        return factor * Decimal(value.replace(' ', ''))
 
     def to_csv(self):
         withdraw = 0
@@ -399,12 +541,19 @@ class Operation:
 parser = argparse.ArgumentParser()
 parser.add_argument("--format", choices=['csv', 'ofx', 'pretty'], default='pretty')
 parser.add_argument("--input", choices=['account', 'credit'], default='account')
+parser.add_argument("--language", choices=['fr', 'en'], default='fr')
+parser.add_argument("--reward", default='0')
+parser.add_argument("--extra-reward", default='0')
+parser.add_argument("--skip", default='')
 parser.add_argument("file")
 args = parser.parse_args()
 
 r = subprocess.run(['pdftotext', '-q', '-nopgbrk', '-bbox', args.file, '-'], stdout=subprocess.PIPE)
 statement = Statement()
-statement.parse(r.stdout.decode().split('\n'))
+statement.load(r.stdout.decode().split('\n'))
+
+initial_balance = None
+final_balance = None
 
 if args.input == 'account':
     PARAMS = BANK_PARAMS
@@ -419,11 +568,10 @@ if args.input == 'account':
     for idx, word in enumerate(words):
         line = word.get_line()
         account = line[0].content
-        #print(account)
 
         word = statement.find_word("reporté", ymin=word.box.y2)
         line = word.get_line()
-        initial_balance = Operation.parse_money(''.join([w.content for w in line[2:]]))
+        initial_balance = EOPOperation.parse_money(''.join([w.content for w in line[2:]]))
 
         page_limit = statement.pages[-1].index
         y_limit = statement.pages[-1].height
@@ -434,7 +582,7 @@ if args.input == 'account':
         except:
             pass
 
-        table = Table(line[0].box.bottom() + PARAMS['line_spacing'], page_limit, y_limit, Operation, year)
+        table = Table(line[0].box.bottom() + PARAMS['line_spacing'], page_limit, y_limit, EOPOperation, year)
         table.add_column('date',    69.714, Column.RIGHT, 25)
         table.add_column('code',    74.300, Column.LEFT,  23.544)
         table.add_column('desc',    98.300, Column.LEFT,  239,   multiline=True)
@@ -454,8 +602,8 @@ elif args.input == 'credit':
     word2 = statement.find_word("002", ymin=word.box.y2)
     line = word.page.get_line(word.box.y1, word.box.y2)
 
-    date_words = statement.find_words_inside(0, 170, 195, 96, 104)
-    year = date_words[-1].content
+    date_words = statement.find_words_inside(0, 100, 195, 96, 104)
+    statement_date = date(*[int(word.content) for word in reversed(date_words)])
 
     # Assert character dimension
 
@@ -482,7 +630,13 @@ elif args.input == 'credit':
     page_limit = statement.pages[-1].index
     y_limit = statement.pages[-1].height
 
-    table = Table(line[0].box.top(), page_limit, y_limit, Transaction, year)
+    summary = Section(SUMMARY_SECTION_HEADER[args.language])
+    summary.add_value(Value(PREV_BALANCE_LABEL[args.language], 'initial_balance', Money))
+    summary.add_value(Value(CURR_BALANCE_LABEL[args.language], 'final_balance', Money))
+
+    transactions = Section(TRANSACTION_SECTION_HEADER[args.language], list())
+
+    table = Table(TRANSACTION_TABLE_HEADER[args.language], Transaction, statement_date)
     table.add_column('day',      line[0].box.mid_x(),     Column.CENTER, 9.6)
     table.add_column('month',    line[1].box.mid_x(),     Column.CENTER, 9.6)
     table.add_column('report_d', line[2].box.mid_x(),     Column.CENTER, 9.6)
@@ -493,27 +647,124 @@ elif args.input == 'credit':
     table.add_column('state',    line[5].box.left(182.4), Column.LEFT,   9.6)
     table.add_column('amount',   line[-1].box.right(cr_shift), Column.RIGHT, 48)
     table.add_column('credit',   line[-1].box.right(cr_shift), Column.LEFT, 9.6, optional=True)
+    transactions.add_table(table)
 
-    transactions = table.parse(statement)
+    table = Table(OPERATION_TABLE_HEADER[args.language], Operation, statement_date)
+    table.add_column('day',      line[0].box.mid_x(),     Column.CENTER, 9.6)
+    table.add_column('month',    line[1].box.mid_x(),     Column.CENTER, 9.6)
+    table.add_column('report_d', line[2].box.mid_x(),     Column.CENTER, 9.6)
+    table.add_column('report_m', line[3].box.mid_x(),     Column.CENTER, 9.6)
+    table.add_column('id',       line[4].box.mid_x(),     Column.CENTER, 14.4, key=True)
+    table.add_column('desc',     line[5].box.left(),      Column.LEFT,   192)
+    table.add_column('amount',   line[-1].box.right(cr_shift), Column.RIGHT, 48)
+    table.add_column('credit',   line[-1].box.right(cr_shift), Column.LEFT, 9.6, optional=True)
+    transactions.add_table(table)
 
+    volume = Section(VOLUME_SECTION_HEADER[args.language], list())
+    table = Table(None, VolumeSummary, None)
+    table.add_column('initial', 124.75, Column.CENTER, 100)
+    table.add_column('current', 230.25, Column.CENTER, 100)
+    table.add_column('final',   383.70, Column.RIGHT,  100)
+    volume.add_table(table)
+
+    reward = Section(REWARD_SECTION_HEADER[args.language], list())
+    table = Table(None, RewardSummary, None)
+    table.add_column('initial',    124.575, Column.CENTER, 80)
+    table.add_column('received',   220.65,  Column.CENTER, 80)
+    table.add_column('spent',      306.95,  Column.CENTER, 80)
+    table.add_column('adjustment', 393.30,  Column.CENTER, 80)
+    table.add_column('final',      489.20,  Column.CENTER, 80)
+    reward.add_table(table)
+
+    statement.add_section(summary)
+    statement.add_section(transactions)
+    statement.add_section(volume)
+    statement.add_section(reward)
+    statement.parse()
+    initial_balance = summary.objects['initial_balance'].value
+    final_balance = summary.objects['final_balance'].value
+
+    if volume.objects:
+        initial_volume = volume.objects[0].initial
+        final_volume = volume.objects[0].final
+    else:
+        initial_volume = 0
+        final_volume = None
+
+    if reward.objects:
+        initial_reward = reward.objects[0].initial
+        final_reward = reward.objects[0].final
+        received_reward = reward.objects[0].received
+        spent_reward = reward.objects[0].spent
+        adjustment_reward = reward.objects[0].adjustment
+        assert(initial_reward + received_reward + spent_reward + adjustment_reward == final_reward)
+    else:
+        adjustment_reward = 0
 
 balance = initial_balance
-for transaction in transactions:
+volume = initial_volume
+total_received_reward = 0
+total_spent_reward = 0
+reward_rate = Decimal(args.reward)
+reward_extra_rate = Decimal(args.extra_reward)
+for transaction in transactions.objects:
     balance = round(balance + transaction.amount, 2)
-    transaction.balance = balance
+    if args.skip and int(transaction.id) in [int(x) for x in args.skip.split(',')]:
+        transaction.skipped = True
+    transaction.calculate_reward(volume, reward_rate, reward_extra_rate)
+    total_received_reward += transaction.reward
+    if transaction.is_valid_for_volume():
+        volume = round(volume + transaction.amount, 2)
+    if transaction.is_reward_spending():
+        total_spent_reward += transaction.amount
     if hasattr(transaction, "balance"):
         assert(balance == transaction.balance)
+    transaction.balance = balance
+if final_balance is not None:
+    assert(balance == final_balance)
+if final_volume is not None:
+    assert(volume == final_volume)
+
+# There are some unaccounted for reward spendings
+if spent_reward != total_spent_reward:
+    spending = RewardSpendingTransaction(statement_date, spent_reward - total_spent_reward)
+    spending.balance = balance
+    transactions.objects.append(spending)
+
+# There seems to be some rounding error sometimes
+if received_reward is not None:
+    rounding_adjustement = received_reward - total_received_reward
+    #assert(abs(rounding_adjustement) < 0.02)
+
+adjustment_reward += rounding_adjustement
+if adjustment_reward:
+    adjustment = RewardAdjustmentTransaction(statement_date, adjustment_reward)
+    adjustment.balance = balance
+    transactions.objects.append(adjustment)
+
 final_balance = balance
+final_volume = volume
 
 if args.format == 'pretty':
-    print("Initial Balance: {:n} $".format(initial_balance))
-    for transaction in transactions:
+    for transaction in transactions.objects:
         print(transaction)
+    print("")
+    print("Initial Balance:           {:8.2f} $".format(initial_balance))
+    print("Final Balance:             {:8.2f} $".format(final_balance))
+    print("")
+    print("Purchasing Volume:         {:8.2f} $".format(final_volume - initial_volume))
+    print("")
+    print("Bonidollars Reported:      {:8.2f} $".format(initial_reward))
+    print("Bonidollars Received:    + {:8.2f} $".format(total_received_reward + rounding_adjustement))
+    print("Bonidollars Spent:       + {:8.2f} $".format(spent_reward))
+    print("Bonidollars Adjustment:  + {:8.2f} $".format(adjustment_reward))
+    print("-------------------------------------")
+    print("Bonidollars Balance:       {:8.2f} $".format(final_reward))
 elif args.format == 'csv':
-    for transaction in transactions:
+    for transaction in transactions.objects:
         print(transaction.to_csv())
 elif args.format == 'ofx':
     print(OFX_HEADER)
-    for transaction in transactions:
+    for transaction in transactions.objects:
         print(transaction.to_ofx())
     print(OFX_FOOTER)
